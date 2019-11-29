@@ -63,10 +63,11 @@
 ]]
 
 local dt = require "darktable"
-local dtutils = require "contrib/dtutils"
+local dtutils = require "lib/dtutils"
 local gettext = dt.gettext
+require "official/yield"
 
-dt.configuration.check_version(...,{3,0,0})
+-- FIXME: do we really need this? dt.configuration.check_version(...,{3,0,0})
 
 -- Tell gettext where to find the .mo file translating messages for a particular domain
 gettext.bindtextdomain("gimp_stack",dt.configuration.config_dir.."/lua/")
@@ -81,54 +82,140 @@ local function show_status(storage, image, format, filename,
   dt.print(string.format(_("Exporting to gimp %i/%i"), number, total))
 end
 
-local function gimp_stack_edit(storage, image_table, extra_data) --finalize
-  if not dtutils.checkIfBinExists("gimp") then
-    dt.print_error(_("gimp not found"))
-    return
-  end
+-- ==== from image_stack ======
+-- copy an images database attributes to another image.  This only
+-- copies what the database knows, not the actual exif data in the 
+-- image itself.
 
-  if not dtutils.checkIfBinExists("convert") then
-    dt.print_error(_("convert not found"))
-    return
+local function copy_image_attributes(from, to, ...)
+  local args = {...}
+  if #args == 0 then
+    args[1] = "all"
   end
+  if args[1] == "all" then
+    args[1] = "rating"
+    args[2] = "colors"
+    args[3] = "exif"
+    args[4] = "meta"
+    args[5] = "GPS"
+  end
+  for _,arg in ipairs(args) do
+    if arg == "rating" then
+      to.rating = from.rating
+    elseif arg == "colors" then
+      to.red = from.red
+      to.blue = from.blue
+      to.green = from.green
+      to.yellow = from.yellow
+      to.purple = from.purple
+    elseif arg == "exif" then
+      to.exif_maker = from.exif_maker
+      to.exif_model = from.exif_model
+      to.exif_lens = from.exif_lens
+      to.exif_aperture = from.exif_aperture
+      to.exif_exposure = from.exif_exposure
+      to.exif_focal_length = from.exif_focal_length
+      to.exif_iso = from.exif_iso
+      to.exif_datetime_taken = from.exif_datetime_taken
+      to.exif_focus_distance = from.exif_focus_distance
+      to.exif_crop = from.exif_crop
+    elseif arg == "GPS" then
+      to.elevation = from.elevation
+      to.longitude = from.longitude
+      to.latitude = from.latitude
+    elseif arg == "meta" then
+      to.publisher = from.publisher
+      to.title = from.title
+      to.creator = from.creator
+      to.rights = from.rights
+      to.description = from.description
+    else
+      dt.print_error(_("Unrecognized option to copy_image_attributes: " .. arg))
+    end
+  end
+end
+
+-- == end of copy_image_attributes from image_stack.lua
+
+local function gimp_stack_edit(storage, image_table, extra_data) --finalize
+  --if not dtutils.check_if_bin_exists("gimp") then
+  --  dt.print_error(_("gimp not found"))
+  --  return
+  --end
+
+  --if not dtutils.check_if_bin_exists("convert") then
+  --  dt.print_error(_("convert not found"))
+  --  return
+  --end
 
   -- list of exported images 
   local img_list
+  local align_list
 
    -- reset and create image list
   img_list = ""
+  align_list = ""
 
   for _,exp_img in pairs(image_table) do
+    -- exp_img = '/tmp/IMG_9519.tif'
     img_list = img_list ..exp_img.. " "
   end
   dt.print_error(img_list)
 
-  local tmp_stack_image = dt.configuration.tmp_dir.."/stack.tif"
 
-  dt.print(_("Stacking images..."))
+  -- Instead of working on a stacked tiff in tmp, we put in
+  -- with the source images so that gimp can also easily save
+  -- an xcf (ignored by dt) in the same directory without having
+  -- to hunt around for the right folder.
+  --
+  -- local tmp_stack_image = dt.configuration.tmp_dir.."/stack.tif"
 
-  os.execute("convert "..img_list.." "..tmp_stack_image)
+  -- FIXME: low-priority. Should check for existing destination file, and make a sensible
+  -- choice rather than blindly over-writing like this.
+  local stack_image = dt.gui.action_images[1].path .. "/" .. dt.gui.action_images[1].filename ..".gimp_stack.tif"
+  -- FIXME: low-priority, but we should be careful to get an actual temp name for
+  -- the prefix to avoid clobbering or including ones we didn't expect to be there.
+  local align_prefix = dt.configuration.tmp_dir.."/"..dt.gui.action_images[1].filename ..".aligned-"
+
+  dt.print(_("Aligning images..."))
+
+  os.execute("align_image_stack -a " .. align_prefix .. " -m -d -i --distortion --gpu "..img_list)
+
+
+  dt.print(_("Stacking images into "..align_prefix.."* ..."))
+
+  
+
+  os.execute("convert "..align_prefix.."*  "..stack_image)
   os.execute("rm "..img_list)
+  os.execute("rm "..align_prefix.."*")
 
   dt.print(_("Launching gimp..."))
 
   local gimpStartCommand
-  gimpStartCommand = "gimp "..tmp_stack_image
+  gimpStartCommand = "gimp "..stack_image
   
   dt.print_error(gimpStartCommand)
 
-  coroutine.yield("RUN_COMMAND", gimpStartCommand)
+  -- coroutine.yield("RUN_COMMAND", gimpStartCommand)
+  -- AJG - probably need to use dtsys.external_command() or something here, I am guessing.
+  os.execute(gimpStartCommand)
 
-  -- for each of the exported images
-  -- find the matching original image
-  -- then move the exported image into the directory with the original  
-  -- then import the image into the database which will group it with the original
-  -- and then copy over any tags other than darktable tags
+  -- AJG seems sensible to wait until after we finish editing before importing. Probably
+  -- OK either way, but we might avoid some thumbnail / metadata weirdnesses.
 
-  local collection_path = dt.gui.action_images[1].path
-  local final_stack_image = collection_path.."/stack.tif"
-  os.execute("mv "..tmp_stack_image.." "..final_stack_image)
-  local myimage = dt.database.import(final_stack_image)
+  dt.print(_("Importing image and copying tags..."))
+  local imported_image = dt.database.import(stack_image)
+  local created_tag = dt.tags.create(_("Created with|gimp_stack|sources ".. img_list ..""))
+  dt.tags.attach(created_tag, imported_image)
+  -- all the images are the same except for time, so just copy the  attributes
+  -- from the first
+  for img,_ in pairs(image_table) do
+    copy_image_attributes(img, imported_image)
+    break
+  end
+
+
   
 end
 
